@@ -1,0 +1,38 @@
+symbol: XAUUSD
+
+mt5:
+  login: ${MT5_LOGIN}
+  password: ${MT5_PASSWORD}
+  server: ${MT5_SERVER}
+  path: ${MT5_PATH}
+  timeout: 60000
+
+price_action:
+  timeframes:
+    primary: M5
+    secondary: M15
+    higher: H1
+  pivot_left_bars: 2
+  pivot_right_bars: 2
+
+order_flow:
+  lookback_minutes: 15
+  use_market_book: true
+
+news:
+  provider: finnhub
+  api_key: ${FINNHUB_API_KEY}
+  blackout_before_min: 15
+  blackout_after_min: 15
+  mode: defensive
+
+risk:
+  risk_per_trade_pct: 0.01
+  max_daily_loss_pct: 0.03
+  max_concurrent_positions: 1
+  atr_period: 14
+  atr_sl_multiplier: 1.5
+  atr_tp_multiplier: 3.0
+
+confluence:
+  min_signals_required: 2
