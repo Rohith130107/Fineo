@@ -1,0 +1,384 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/config.yaml repo/config.yaml
+--- repo_orig/config.yaml	2026-09-09 18:08:30.000000000 +0000
++++ repo/config.yaml	2026-09-09 18:18:05.497268327 +0000
+@@ -17,7 +17,10 @@
+ 
+ order_flow:
+   lookback_minutes: 15
+-  use_market_book: true
++  # DOM-based order flow (market_book_get) is not implemented yet — the bot always
++  # uses the tick-derived proxy regardless of this flag. Kept as false so the config
++  # doesn't claim a capability the code doesn't have. See src/order_flow.py.
++  use_market_book: false
+ 
+ news:
+   provider: finnhub
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/confluence_engine.py repo/src/confluence_engine.py
+--- repo_orig/src/confluence_engine.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/confluence_engine.py	2026-09-09 18:17:25.175280926 +0000
+@@ -16,11 +16,17 @@
+ class ConfluenceEngine:
+     """
+     Confluence Decision Engine combining Price Action, Order Flow, and News Gate signals.
++
+     Rules per PRD.md:
+-    1. News filter acts as a defensive gate — blocks entries if blackout_active is True.
+-    2. Minimum required signals (default 2 of 3, where news gate passing counts as 1 gate clearance,
+-       or both Price Action and Order Flow agree on direction).
+-    3. Confluence requires Price Action and Order Flow directions to not conflict.
++    1. News filter is a mandatory gate — blocks entries outright if blackout_active is True.
++       Passing the gate is a *prerequisite* for evaluating a trade, never one of the counted
++       confirming signals. A quiet news calendar can never substitute for a real directional
++       signal from price action or order flow.
++    2. A trade requires min_signals_required independently confirming directional signals
++       out of {price_action, order_flow} (default 2 of 2 — both modules must agree in
++       direction and each must clear min_confidence).
++    3. If Price Action and Order Flow disagree in direction (one BUY, one SELL), the trade
++       is blocked outright regardless of individual confidence.
+     """
+     def __init__(self, min_signals_required: int = 2, min_confidence: float = 0.5):
+         self.min_signals_required = min_signals_required
+@@ -33,7 +39,7 @@
+             "order_flow": of_signal
+         }
+ 
+-        # News Filter Gate Check
++        # News Filter Gate Check (mandatory prerequisite, not a counted signal)
+         if blackout_active:
+             reasons.append("BLOCKED: News blackout window is active")
+             return DecisionResult(
+@@ -44,9 +50,8 @@
+                 module_signals=module_signals
+             )
+ 
+-        reasons.append("PASS: News gate open")
++        reasons.append("PASS: News gate open (prerequisite only, not counted as a signal)")
+ 
+-        # Evaluate directional agreement between Price Action and Order Flow
+         pa_dir = pa_signal.signal
+         of_dir = of_signal.signal
+ 
+@@ -61,52 +66,29 @@
+                 module_signals=module_signals
+             )
+ 
+-        # Determine target direction
++        # Count confirming signals independently — news gate is NOT counted here.
++        signal_count = 0
++        confidences = []
+         target_dir = TradeSignal.NEUTRAL
+-        if pa_dir != TradeSignal.NEUTRAL:
+-            target_dir = pa_dir
+-        elif of_dir != TradeSignal.NEUTRAL:
+-            target_dir = of_dir
+-
+-        if target_dir == TradeSignal.NEUTRAL:
+-            reasons.append("NEUTRAL: Neither Price Action nor Order Flow generated directional signal")
+-            return DecisionResult(
+-                action=TradeSignal.NEUTRAL,
+-                confidence=0.0,
+-                reasons=reasons,
+-                blackout_active=False,
+-                module_signals=module_signals
+-            )
+ 
+-        # Count confirming signals:
+-        # News gate pass = +1
+-        # Price Action matching = +1
+-        # Order Flow matching = +1
+-        signal_count = 1 # Start with 1 for passing news gate
+-
+-        confidences = []
+-        if pa_dir == target_dir and pa_signal.confidence >= self.min_confidence:
++        if pa_dir != TradeSignal.NEUTRAL and pa_signal.confidence >= self.min_confidence:
+             signal_count += 1
+             confidences.append(pa_signal.confidence)
+-            reasons.append(f"CONFIRM: Price Action agrees ({pa_dir.value}, conf={pa_signal.confidence:.2f})")
++            target_dir = pa_dir
++            reasons.append(f"CONFIRM: Price Action ({pa_dir.value}, conf={pa_signal.confidence:.2f})")
+ 
+-        if of_dir == target_dir and of_signal.confidence >= self.min_confidence:
+-            signal_count += 1
+-            confidences.append(of_signal.confidence)
+-            reasons.append(f"CONFIRM: Order Flow agrees ({of_dir.value}, conf={of_signal.confidence:.2f})")
++        if of_dir != TradeSignal.NEUTRAL and of_signal.confidence >= self.min_confidence:
++            if target_dir != TradeSignal.NEUTRAL and of_dir != target_dir:
++                # Shouldn't happen given the conflict check above, but guard anyway.
++                pass
++            else:
++                signal_count += 1
++                confidences.append(of_signal.confidence)
++                target_dir = of_dir
++                reasons.append(f"CONFIRM: Order Flow ({of_dir.value}, conf={of_signal.confidence:.2f})")
+ 
+-        if signal_count >= self.min_signals_required and confidences:
+-            avg_confidence = float(sum(confidences) / len(confidences))
+-            reasons.append(f"DECISION: {target_dir.value} confirmed with {signal_count} signals")
+-            return DecisionResult(
+-                action=target_dir,
+-                confidence=avg_confidence,
+-                reasons=reasons,
+-                blackout_active=False,
+-                module_signals=module_signals
+-            )
+-        else:
+-            reasons.append(f"INSUFFICIENT: Got {signal_count} signals, required {self.min_signals_required}")
++        if target_dir == TradeSignal.NEUTRAL or signal_count < self.min_signals_required:
++            reasons.append(f"INSUFFICIENT: Got {signal_count} confirming signal(s), required {self.min_signals_required}")
+             return DecisionResult(
+                 action=TradeSignal.NEUTRAL,
+                 confidence=0.0,
+@@ -114,3 +96,13 @@
+                 blackout_active=False,
+                 module_signals=module_signals
+             )
++
++        avg_confidence = float(sum(confidences) / len(confidences))
++        reasons.append(f"DECISION: {target_dir.value} confirmed with {signal_count} independent signal(s)")
++        return DecisionResult(
++            action=target_dir,
++            confidence=avg_confidence,
++            reasons=reasons,
++            blackout_active=False,
++            module_signals=module_signals
++        )
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/mt5_base.py repo/src/mt5_base.py
+--- repo_orig/src/mt5_base.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/mt5_base.py	2026-09-09 18:17:52.647434995 +0000
+@@ -47,3 +47,13 @@
+     @abstractmethod
+     def close_position(self, ticket: int) -> Dict[str, Any]:
+         pass
++
++    def get_market_book(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
++        """
++        Returns real Level 2 order book (DOM) entries if the connector/broker supports
++        it, else None. Not all connectors or brokers support this — callers (e.g.
++        OrderFlowAnalyzer) must fall back to the tick-derived proxy when this returns
++        None, and should log that fallback rather than silently assuming DOM was used.
++        Default implementation: unsupported.
++        """
++        return None
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/mt5_factory.py repo/src/mt5_factory.py
+--- repo_orig/src/mt5_factory.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/mt5_factory.py	2026-09-09 18:17:37.745099340 +0000
+@@ -1,10 +1,15 @@
+ import os
++import logging
+ from src.mt5_base import MT5BaseConnector
+ from src.mt5_mock import MT5MockConnector
+ 
++logger = logging.getLogger(__name__)
++
+ def get_mt5_connector(config: dict) -> MT5BaseConnector:
+     # Always prefer MT5LiveConnector if MetaTrader5 is installed and running,
+     # otherwise fallback to MT5MockConnector for testing / non-Windows environments.
++    # IMPORTANT: this fallback is logged loudly, since a silent fallback would let
++    # the bot "run" against mock/simulated data while looking like it's live.
+     mt5_cfg = config.get("mt5", {})
+     try:
+         from src.mt5_live import MT5LiveConnector
+@@ -16,4 +21,10 @@
+         )
+         return connector
+     except ImportError:
++        logger.warning(
++            "MetaTrader5 package not available on this system — falling back to "
++            "MT5MockConnector. NO REAL OR DEMO TRADES WILL BE PLACED. This is expected "
++            "on non-Windows dev machines but must NOT happen on the machine you intend "
++            "to run paper/live trading from."
++        )
+         return MT5MockConnector()
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/mt5_live.py repo/src/mt5_live.py
+--- repo_orig/src/mt5_live.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/mt5_live.py	2026-09-09 18:17:56.325453781 +0000
+@@ -160,6 +160,26 @@
+             return {"retcode": -1, "comment": f"order_send returned None: {mt5.last_error()}"}
+         return result._asdict()
+ 
++    def get_market_book(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
++        """
++        Attempts to subscribe to and read the real Level 2 order book (DOM) for symbol.
++        Returns None if the broker/symbol doesn't expose market depth (common on many
++        retail XAUUSD feeds) — callers must treat None as "fall back to tick proxy",
++        not as an error.
++        """
++        if not mt5.market_book_add(symbol):
++            return None
++        try:
++            book = mt5.market_book_get(symbol)
++            if book is None:
++                return None
++            return [
++                {"type": entry.type, "price": entry.price, "volume": entry.volume}
++                for entry in book
++            ]
++        finally:
++            mt5.market_book_release(symbol)
++
+     def close_position(self, ticket: int) -> Dict[str, Any]:
+         positions = mt5.positions_get(ticket=ticket)
+         if not positions:
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/news_filter.py repo/src/news_filter.py
+--- repo_orig/src/news_filter.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/news_filter.py	2026-09-09 18:17:41.725190341 +0000
+@@ -103,8 +103,14 @@
+             return []
+ 
+     def _fetch_tradingeconomics(self, date_from: datetime, date_to: datetime) -> List[NewsEvent]:
+-        # TradingEconomics REST endpoint stub
+-        return []
++        # NOT YET IMPLEMENTED. Returning [] here would be indistinguishable from a
++        # genuinely quiet calendar and would silently disable news-blackout protection
++        # for anyone who sets news.provider=tradingeconomics. Fail loudly instead.
++        raise NotImplementedError(
++            "TradingEconomics provider is not implemented. Set news.provider to "
++            "'finnhub' in config.yaml, or implement _fetch_tradingeconomics before "
++            "using this provider — do not silently trade with news protection disabled."
++        )
+ 
+     def is_blackout_active(self, current_time: Optional[datetime] = None, events: Optional[List[NewsEvent]] = None) -> Tuple[bool, List[NewsEvent]]:
+         """
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/order_flow.py repo/src/order_flow.py
+--- repo_orig/src/order_flow.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/order_flow.py	2026-09-09 18:18:01.499694818 +0000
+@@ -107,7 +107,21 @@
+             exhaustion_flag=exhaustion_flag
+         )
+ 
+-    def evaluate(self, ticks_df: pd.DataFrame, rates_df: Optional[pd.DataFrame] = None) -> SignalOutput:
++    def evaluate(self, ticks_df: pd.DataFrame, rates_df: Optional[pd.DataFrame] = None,
++                 market_book: Optional[List[Dict[str, Any]]] = None) -> SignalOutput:
++        if market_book is not None:
++            # Real DOM available — this branch is intentionally unimplemented for now.
++            # We do NOT silently pretend to use it while actually running the tick
++            # proxy underneath. If you want real DOM-based order flow, implement the
++            # book-imbalance calculation here.
++            logger.warning(
++                "market_book data was passed to OrderFlowAnalyzer.evaluate() but DOM-based "
++                "evaluation is not implemented — falling back to tick-derived proxy. "
++                "Do not assume this signal reflects real order book imbalance."
++            )
++        else:
++            logger.debug("No market_book data available — using tick-derived order flow proxy.")
++
+         if ticks_df.empty:
+             return SignalOutput(
+                 module_name="order_flow",
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/src/risk_manager.py repo/src/risk_manager.py
+--- repo_orig/src/risk_manager.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/src/risk_manager.py	2026-09-09 18:17:30.497899467 +0000
+@@ -123,9 +123,23 @@
+         # 4. Position Sizing based on fixed % risk
+         risk_amount = equity * self.risk_per_trade_pct
+         # Risk = Volume * contract_size * sl_dist
+-        volume = risk_amount / (self.contract_size * sl_dist)
+-        volume = round(volume, 2)
+-        volume = max(self.min_lot, min(self.max_lot, volume))
++        raw_volume = risk_amount / (self.contract_size * sl_dist)
++        volume = round(raw_volume, 2)
++
++        # Never round UP to min_lot — that would silently risk more than
++        # risk_per_trade_pct on the account. If the risk-based size is below
++        # the broker's minimum lot, reject the trade instead of oversizing it.
++        if volume < self.min_lot:
++            return RiskCheckResult(
++                allowed=False,
++                reason=(
++                    f"Calculated position size ({volume:.4f} lots) is below broker "
++                    f"minimum ({self.min_lot} lots) for the configured "
++                    f"{self.risk_per_trade_pct*100:.2f}% risk — skipping trade rather "
++                    f"than over-risking by sizing up to the minimum lot."
++                )
++            )
++        volume = min(self.max_lot, volume)
+ 
+         return RiskCheckResult(
+             allowed=True,
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/tests/test_confluence_engine.py repo/tests/test_confluence_engine.py
+--- repo_orig/tests/test_confluence_engine.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/tests/test_confluence_engine.py	2026-09-09 18:18:15.559057196 +0000
+@@ -31,11 +31,34 @@
+     assert result.action == TradeSignal.NEUTRAL
+     assert any("CONFLICT" in r for r in result.reasons)
+ 
+-def test_confluence_single_signal_pass():
++def test_confluence_single_signal_is_no_longer_sufficient():
++    """
++    Regression test: news-gate-passing must NOT count as a confirming signal.
++    A lone price-action signal with order flow neutral should NOT fire a trade
++    when min_signals_required=2, since only 1 of 2 modules actually confirmed.
++    """
+     engine = ConfluenceEngine(min_signals_required=2, min_confidence=0.5)
+     pa = SignalOutput("price_action", TradeSignal.BUY, 0.8)
+     of = SignalOutput("order_flow", TradeSignal.NEUTRAL, 0.0)
+ 
+     result = engine.evaluate(pa, of, blackout_active=False)
++    assert result.action == TradeSignal.NEUTRAL
++    assert any("INSUFFICIENT" in r for r in result.reasons)
++
++def test_confluence_low_confidence_signal_not_counted():
++    """A directional signal below min_confidence should not count as a confirmation."""
++    engine = ConfluenceEngine(min_signals_required=2, min_confidence=0.6)
++    pa = SignalOutput("price_action", TradeSignal.BUY, 0.8)
++    of = SignalOutput("order_flow", TradeSignal.BUY, 0.3)  # below threshold
++
++    result = engine.evaluate(pa, of, blackout_active=False)
++    assert result.action == TradeSignal.NEUTRAL
++
++def test_confluence_min_signals_required_one_allows_single_confirmation():
++    """If explicitly configured for 1-of-2, a single strong signal should be enough."""
++    engine = ConfluenceEngine(min_signals_required=1, min_confidence=0.5)
++    pa = SignalOutput("price_action", TradeSignal.BUY, 0.8)
++    of = SignalOutput("order_flow", TradeSignal.NEUTRAL, 0.0)
++
++    result = engine.evaluate(pa, of, blackout_active=False)
+     assert result.action == TradeSignal.BUY
+-    assert result.confidence == 0.8
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/tests/test_news_filter.py repo/tests/test_news_filter.py
+--- repo_orig/tests/test_news_filter.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/tests/test_news_filter.py	2026-09-09 18:18:27.937263457 +0000
+@@ -46,3 +46,13 @@
+ 
+     is_active, events = news_mod.is_blackout_active(current_time=event_time, events=[low_event])
+     assert is_active is False
++
++def test_tradingeconomics_fails_loudly_not_silently():
++    """
++    Regression test: an unimplemented provider must raise, not return an empty
++    event list — an empty list is indistinguishable from "genuinely no news today"
++    and would silently disable blackout protection.
++    """
++    news_mod = NewsFilterModule(provider="tradingeconomics", api_key="dummy_key")
++    with pytest.raises(NotImplementedError):
++        news_mod.fetch_events()
+diff -ruN '--exclude=__pycache__' '--exclude=.pytest_cache' repo_orig/tests/test_risk_manager.py repo/tests/test_risk_manager.py
+--- repo_orig/tests/test_risk_manager.py	2026-09-09 18:08:30.000000000 +0000
++++ repo/tests/test_risk_manager.py	2026-09-09 18:18:19.630042924 +0000
+@@ -55,6 +55,26 @@
+     assert res.allowed is False
+     assert "Circuit breaker active" in res.reason
+ 
++def test_undersized_trade_rejected_not_rounded_up(sample_rates):
++    """
++    Regression test: if the risk-based position size comes out below the broker's
++    minimum lot, the trade must be REJECTED, not silently rounded up to min_lot
++    (which would risk more than risk_per_trade_pct).
++    """
++    rm = RiskManager(risk_per_trade_pct=0.0001, atr_sl_multiplier=1.5, min_lot=0.01)
++    account_info = {"balance": 10000.0, "equity": 10000.0}
++
++    res = rm.check_trade_allowed(
++        order_type=OrderType.BUY,
++        current_price=2000.0,
++        account_info=account_info,
++        rates_df=sample_rates,
++        open_positions=[]
++    )
++
++    assert res.allowed is False
++    assert "below broker minimum" in res.reason
++
+ def test_max_concurrent_positions(sample_rates):
+     rm = RiskManager(max_concurrent_positions=1)
+     account_info = {"balance": 10000.0, "equity": 10000.0}
