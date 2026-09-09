@@ -1,0 +1,7 @@
+# Git Ignore
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+data/
